@@ -1,4 +1,4 @@
-name: 'PromptEval'
+name: 'PromptEval Prompt Gate'
 description: 'Lint prompts and gate CI on score, conflicting instructions, and regression vs your production version.'
 author: 'PromptEval'
 branding:
