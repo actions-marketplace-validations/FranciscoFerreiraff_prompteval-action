@@ -1,0 +1,144 @@
+name: 'PromptEval'
+description: 'Lint prompts and gate CI on score, conflicting instructions, and regression vs your production version.'
+author: 'PromptEval'
+branding:
+  icon: 'check-circle'
+  color: 'purple'
+
+inputs:
+  api_key:
+    description: 'PromptEval API key (pe_live_...). Store it as a repository secret.'
+    required: true
+  prompt:
+    description: 'Prompt text to evaluate. Provide this OR prompt_file.'
+    required: false
+    default: ''
+  prompt_file:
+    description: 'Path to a file containing the prompt. Provide this OR prompt.'
+    required: false
+    default: ''
+  min_score:
+    description: 'Minimum passing score (0-100). If omitted, your account production threshold is used.'
+    required: false
+    default: ''
+  fail_on_conflict:
+    description: 'Fail the build if conflicting instructions are detected (true/false).'
+    required: false
+    default: 'false'
+  baseline_slug:
+    description: 'A PromptEval prompt slug. Gates regression against that prompt''s current production version. The recommended way to reference a baseline.'
+    required: false
+    default: ''
+  baseline_version_id:
+    description: 'Advanced: a specific library version id to gate regression against. Prefer baseline_slug.'
+    required: false
+    default: ''
+  max_drop:
+    description: 'Maximum score drop vs the baseline before failing (default 0 = any drop fails).'
+    required: false
+    default: ''
+  mode:
+    description: 'lint (score + conflicts, default) or full (adds graph + recommendations + improved prompt; needs Pro/Team or BYOK).'
+    required: false
+    default: 'lint'
+  provider_key:
+    description: 'Optional Anthropic API key (BYOK). Runs on your key: no quota, unlocks full on any plan.'
+    required: false
+    default: ''
+  api_url:
+    description: 'PromptEval API endpoint.'
+    required: false
+    default: 'https://prompt-eval.com/api/v1/eval'
+
+runs:
+  using: 'composite'
+  steps:
+    - shell: bash
+      env:
+        API_KEY: ${{ inputs.api_key }}
+        PROMPT_INPUT: ${{ inputs.prompt }}
+        PROMPT_FILE: ${{ inputs.prompt_file }}
+        MIN_SCORE: ${{ inputs.min_score }}
+        FAIL_ON_CONFLICT: ${{ inputs.fail_on_conflict }}
+        BASELINE_SLUG: ${{ inputs.baseline_slug }}
+        BASELINE_VERSION_ID: ${{ inputs.baseline_version_id }}
+        MAX_DROP: ${{ inputs.max_drop }}
+        MODE: ${{ inputs.mode }}
+        PROVIDER_KEY: ${{ inputs.provider_key }}
+        API_URL: ${{ inputs.api_url }}
+      run: |
+        set -euo pipefail
+
+        PROMPT="$PROMPT_INPUT"
+        if [ -z "$PROMPT" ] && [ -n "$PROMPT_FILE" ]; then
+          PROMPT="$(cat "$PROMPT_FILE")"
+        fi
+        if [ -z "$PROMPT" ]; then
+          echo "::error::Provide either 'prompt' or 'prompt_file'."
+          exit 1
+        fi
+
+        # Build request body with jq (safe escaping).
+        BODY=$(jq -n --arg prompt "$PROMPT" --arg mode "$MODE" '{prompt:$prompt, mode:$mode}')
+        if [ -n "$MIN_SCORE" ]; then BODY=$(printf '%s' "$BODY" | jq --argjson v "$MIN_SCORE" '. + {min_score:$v}'); fi
+        if [ "$FAIL_ON_CONFLICT" = "true" ]; then BODY=$(printf '%s' "$BODY" | jq '. + {fail_on_conflict:true}'); fi
+        if [ -n "$BASELINE_SLUG" ]; then BODY=$(printf '%s' "$BODY" | jq --arg v "$BASELINE_SLUG" '. + {baseline_slug:$v}'); fi
+        if [ -n "$BASELINE_VERSION_ID" ]; then BODY=$(printf '%s' "$BODY" | jq --arg v "$BASELINE_VERSION_ID" '. + {baseline_version_id:$v}'); fi
+        if [ -n "$MAX_DROP" ]; then BODY=$(printf '%s' "$BODY" | jq --argjson v "$MAX_DROP" '. + {max_drop:$v}'); fi
+
+        HDRS=(-H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json")
+        if [ -n "$PROVIDER_KEY" ]; then HDRS+=(-H "X-Provider-Key: $PROVIDER_KEY"); fi
+
+        RESP=$(curl -sS -w $'\n%{http_code}' -X POST "$API_URL" "${HDRS[@]}" -d "$BODY")
+        HTTP=$(printf '%s' "$RESP" | tail -n1)
+        JSON=$(printf '%s' "$RESP" | sed '$d')
+
+        if [ "$HTTP" != "200" ]; then
+          echo "::error::PromptEval API returned HTTP $HTTP"
+          printf '%s\n' "$JSON" | jq -r '.message // .error // .' 2>/dev/null || printf '%s\n' "$JSON"
+          exit 1
+        fi
+
+        PASS=$(printf '%s' "$JSON" | jq -r '.pass')
+        SCORE=$(printf '%s' "$JSON" | jq -r '.score')
+        MINS=$(printf '%s' "$JSON" | jq -r '.min_score')
+
+        echo "PromptEval - score $SCORE (min $MINS)"
+        printf '%s' "$JSON" | jq -r '.dimensions | "  clarity \(.clarity) | specificity \(.specificity) | structure \(.structure) | robustness \(.robustness)"'
+
+        CONFLICTS=$(printf '%s' "$JSON" | jq -r '.conflicts | length')
+        if [ "$CONFLICTS" -gt 0 ]; then
+          echo "  conflicts:"
+          printf '%s' "$JSON" | jq -r '.conflicts[] | "    - \(.a)  <>  \(.b)  [\(.type)]"'
+        fi
+
+        if [ "$(printf '%s' "$JSON" | jq -r 'has("regression")')" = "true" ]; then
+          printf '%s' "$JSON" | jq -r '.regression | "  regression: baseline \(.baseline_score) -> \(.current_score) (delta \(.delta), max_drop \(.max_drop))" + (if .regressed then "  [REGRESSED]" else "" end)'
+        fi
+
+        # Render a job summary in the GitHub UI (best-effort).
+        {
+          echo "### PromptEval"
+          echo ""
+          echo "- **Score:** $SCORE (min $MINS)"
+          echo "- **Pass:** $PASS"
+          if [ "$CONFLICTS" -gt 0 ]; then echo "- **Conflicts:** $CONFLICTS"; fi
+        } >> "${GITHUB_STEP_SUMMARY:-/dev/null}" || true
+
+        if [ "$PASS" = "true" ]; then
+          echo "PromptEval: PASS (score $SCORE)"
+        else
+          echo "PromptEval: FAIL"
+          if awk "BEGIN{exit !($SCORE < $MINS)}"; then
+            echo "::error::Score $SCORE is below the minimum $MINS."
+          fi
+          CONTRA=$(printf '%s' "$JSON" | jq -r '[.conflicts[]? | select(.type=="contradiction")] | length')
+          if [ "$FAIL_ON_CONFLICT" = "true" ] && [ "$CONTRA" -gt 0 ]; then
+            echo "::error::$CONTRA contradicting instruction(s) detected (fail_on_conflict is on)."
+          fi
+          if [ "$(printf '%s' "$JSON" | jq -r '.regression.regressed // false')" = "true" ]; then
+            BASE=$(printf '%s' "$JSON" | jq -r '.regression.baseline_score')
+            echo "::error::Prompt regressed vs baseline ($BASE -> $SCORE)."
+          fi
+          exit 1
+        fi
